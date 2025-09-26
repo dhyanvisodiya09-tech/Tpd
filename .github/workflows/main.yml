@@ -1,0 +1,209 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if desired)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Replace any existing firewall rule with the same name and allow RDP
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "rule delete ignored"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Restart Remote Desktop service to apply changes
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        shell: pwsh
+        id: create_user
+        run: |
+          # generate a strong random password
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          # convert and create user if missing
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -Description "Temporary RDP user from GitHub Actions"
+          }
+
+          # ensure the user is in the right groups
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          # export credentials to environment (but do NOT print password to logs)
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale CLI (Portable)
+        shell: pwsh
+        id: install_ts
+        run: |
+          # extract location under workspace so subsequent steps can use it
+          $zipUrl = "https://pkgs.tailscale.com/stable/tailscale-windows-amd64.zip"
+          $zipPath = "$env:TEMP\tailscale.zip"
+          $extractPath = Join-Path $env:GITHUB_WORKSPACE "tailscale-portable"
+
+          Write-Host "Downloading Tailscale portable..."
+          Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+          if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+          Remove-Item $zipPath -Force
+
+          $tsExe = Join-Path $extractPath "tailscale.exe"
+          if (-not (Test-Path $tsExe)) {
+              Write-Error "Portable Tailscale binary not found at $tsExe"
+              exit 1
+          }
+          Write-Host "Tailscale CLI extracted to $tsExe"
+
+          # Save the path for later steps
+          echo "TAILSCALE_EXE=$tsExe" >> $env:GITHUB_ENV
+
+      - name: Establish Tailscale Connection (bring up)
+        shell: pwsh
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          # use the portable excutable path set earlier
+          $tsExe = "$env:TAILSCALE_EXE"
+          if (-not (Test-Path $tsExe)) {
+              Write-Error "Tailscale executable path missing: $tsExe"
+              exit 1
+          }
+
+          # bring up tailscale (do not echo the auth key)
+          & $tsExe up --authkey=$env:TS_AUTH_KEY --hostname="gh-runner-$env:GITHUB_RUN_ID" --accept-routes || Write-Host "tailscale up returned non-zero or printed warnings"
+
+          # wait for IPv4 assignment
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 20) {
+              $tsIP = (& $tsExe ip -4) -join " "
+              if ($tsIP -and $tsIP.Trim() -ne "") { break }
+              Start-Sleep -Seconds 3
+              $retries++
+          }
+
+          if (-not $tsIP -or $tsIP.Trim() -eq "") {
+              Write-Error "Tailscale IP not assigned within timeout."
+              exit 1
+          }
+
+          # pick first IPv4 address (tailscale ip may return multiple addresses)
+          $firstIP = ($tsIP -split '\s+' | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } | Select-Object -First 1)
+          if (-not $firstIP) {
+              Write-Error "Could not parse a valid IPv4 address from: $tsIP"
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$firstIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP assigned (hidden from logs variable)."
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          $ip = $env:TAILSCALE_IP
+          Write-Host "Testing TCP connectivity to $ip:3389..."
+          $test = Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue
+          if (-not $test.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed (from runner). RDP may not yet be accepting connections."
+              exit 1
+          }
+          Write-Host "TCP connectivity OK."
+
+      - name: Create credentials file and upload as artifact
+        shell: pwsh
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-credentials
+          path: rdp-credentials.txt
+        run: |
+          # create a credentials file in workspace (this file will be uploaded; don't cat it)
+          $credsPath = Join-Path $env:GITHUB_WORKSPACE "rdp-credentials.txt"
+          $content = @"
+RDP Address: $env:TAILSCALE_IP
+Username: $env:RDP_USER
+Password: $env:RDP_PASS
+
+Notes:
+- Connect using Windows Remote Desktop (mstsc) or Tailscale clients directly.
+- This file is uploaded as an artifact; download and delete it after use.
+"@
+          # write file without printing its contents
+          $content | Out-File -FilePath $credsPath -Encoding UTF8
+
+          # actions/upload-artifact action (declared on this step) will upload the file
+
+      - name: Maintain Connection (keeps runner alive)
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACTIVE — artifact contains credentials ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Credential file uploaded as artifact 'rdp-credentials'. Do NOT print password in logs."
+          Write-Host "==================`n"
+
+          # keep runner alive until canceled
+          while ($true) {
+              Start-Sleep -Seconds 300
+          )
+
+      - name: Cleanup (always runs)
+        if: always()
+        shell: pwsh
+        run: |
+          # Attempt to shut down tailscale and remove user. This runs regardless of workflow result.
+          $tsExe = "$env:TAILSCALE_EXE"
+          if (Test-Path $tsExe) {
+              Try {
+                  & $tsExe down
+              } Catch {
+                  Write-Host "tailscale down failed or already down."
+              }
+          }
+
+          # Remove firewall rule (ignore errors)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "no firewall rule to delete"
+
+          # Optionally remove the RDP user created earlier - uncomment if you want deletion
+          Try {
+              if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+                  # Remove-LocalUser -Name "RDP"
+                  Write-Host "RDP user exists. If you want to auto-delete it, uncomment Remove-LocalUser line."
+              }
+          } Catch {
+              Write-Host "Error checking/removing RDP user."
+          }
+
+          # Remove portable tailscale folder if present
+          $extractPath = Join-Path $env:GITHUB_WORKSPACE "tailscale-portable"
+          if (Test-Path $extractPath) {
+              Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
+          }
