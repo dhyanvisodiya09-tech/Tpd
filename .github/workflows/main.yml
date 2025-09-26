@@ -80,20 +80,23 @@ jobs:
         run: |
           $tsExe = "$env:TAILSCALE_EXE"
           if (-not (Test-Path $tsExe)) { Write-Error "Tailscale executable missing"; exit 1 }
+
           & $tsExe up --authkey=$env:TS_AUTH_KEY --hostname="gh-runner-$env:GITHUB_RUN_ID" --accept-routes
 
+          # Wait for Tailscale IP (line 125 fixed)
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 20)
           {
-              $tsIP = (& $tsExe ip -4) -join " "
-              if ($tsIP -and $tsIP.Trim() -ne "") { break }
+              $ips = & $tsExe ip -4
+              $tsIP = ($ips -split '\s+' | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } | Select-Object -First 1)
+              if ($tsIP) { break }
               Start-Sleep -Seconds 3
               $retries++
           }
-          $firstIP = ($tsIP -split '\s+' | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } | Select-Object -First 1)
-          if (-not $firstIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
-          echo "TAILSCALE_IP=$firstIP" >> $env:GITHUB_ENV
+
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       - name: Verify RDP
         shell: pwsh
