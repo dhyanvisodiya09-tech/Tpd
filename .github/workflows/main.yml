@@ -17,20 +17,12 @@ jobs:
         shell: pwsh
         run: |
           Write-Host ">>> Enabling RDP and configuring firewall..."
-          # Enable RDP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-          # Optional: Disable NLA
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
-
-          # Firewall
           netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
           Restart-Service -Name TermService -Force
 
@@ -90,7 +82,6 @@ jobs:
           if (-not (Test-Path $tsExe)) { Write-Error "Tailscale executable missing"; exit 1 }
           & $tsExe up --authkey=$env:TS_AUTH_KEY --hostname="gh-runner-$env:GITHUB_RUN_ID" --accept-routes
 
-          # Wait for IP assignment
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 20)
